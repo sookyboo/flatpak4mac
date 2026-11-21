@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# LightDM graphical session selector for Flatpak4Mac.
+# Run via sudo on the Ubuntu guest. Never changes the UTM VM itself.
+set -Eeuo pipefail
+mode="${1:-}"
+case "$mode" in
+  xfce|retrodeck|plasma|plasma-x11|plasma-wayland) ;;
+  *) echo 'Usage: flatpak4mac-session-mode xfce|retrodeck|plasma|plasma-x11|plasma-wayland [--no-restart]' >&2; exit 2 ;;
+esac
+[[ "${2:-}" == '' || "${2:-}" == --no-restart ]] || { echo 'Unknown argument' >&2; exit 2; }
+[[ "$(id -u)" == 0 ]] || { echo 'Run as root' >&2; exit 1; }
+
+# Select by actual installed desktop entries, not a guessed package version.
+case "$mode" in
+  xfce)
+    [[ -f /usr/share/xsessions/xfce.desktop ]] || { echo 'XFCE X11 session is missing' >&2; exit 1; }
+    session=xfce ;;
+  retrodeck)
+    [[ -f /usr/share/xsessions/flatpak4mac-retrodeck.desktop ]] || { echo 'RetroDECK X11 session is missing' >&2; exit 1; }
+    session=flatpak4mac-retrodeck ;;
+  plasma|plasma-x11)
+    [[ -f /usr/share/xsessions/plasma.desktop ]] || { echo 'Plasma X11 session is missing' >&2; exit 1; }
+    session=plasma ;;
+  plasma-wayland)
+    session=''
+    # Plasma 5 (Ubuntu 24.04) normally provides plasmawayland.desktop.
+    for entry in plasmawayland plasma; do
+      if [[ -f "/usr/share/wayland-sessions/$entry.desktop" ]]; then
+        session="$entry"
+        break
+      fi
+    done
+    [[ -n "$session" ]] || { echo 'Plasma Wayland session not found in /usr/share/wayland-sessions' >&2; exit 1; }
+    ;;
+esac
+
+config=/etc/lightdm/lightdm.conf.d/60-flatpak-autologin.conf
+mkdir -p /etc/lightdm/lightdm.conf.d
+# Keep other LightDM configuration in place. The existing Flatpak4Mac setup
+# owns this autologin fragment; avoid reconfiguring PAM, display manager, etc.
+tmp="$(mktemp /etc/lightdm/lightdm.conf.d/.flatpak-autologin.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT
+cat > "$tmp" <<EOF
+[Seat:*]
+autologin-user=flatpak
+autologin-user-timeout=0
+user-session=$session
+autologin-session=$session
+EOF
+chmod 644 "$tmp"
+if [[ -f "$config" ]] && cmp -s "$config" "$tmp"; then
+  echo "LightDM already configured for $mode ($session)."
+else
+  install -m 644 "$tmp" "$config"
+  echo "Selected LightDM session: $mode ($session)."
+fi
+if [[ "${2:-}" == --no-restart ]]; then
+  exit 0
+fi
+# A user-session SSH command cannot safely kill its own user manager.
+# Hand off to a root-owned systemd transient service using a short timer.
+worker=/usr/local/sbin/flatpak4mac-session-switch-worker
+[[ -x "$worker" ]] || { echo "ERROR: Missing $worker; rerun quick-retrodeck.sh to install updated helpers" >&2; exit 1; }
+unit="flatpak4mac-session-switch-$(date +%s)-$$"
+systemd-run --quiet --unit="$unit" --on-active=3s \
+  --timer-property=AccuracySec=1s --property=Type=oneshot \
+  "$worker" "$mode"
+echo "Queued clean $mode session switch; flatpak GUI and SSH sessions will close shortly."
+echo 'After reconnecting, inspect: sudo journalctl -b -u "flatpak4mac-session-switch-*" --no-pager'

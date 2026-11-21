@@ -1,0 +1,12 @@
+[Unit]
+Description=Flatpak4Mac desktop and Flatpak provisioning
+Wants=network-online.target
+After=network-online.target cloud-final.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/flatpak4mac-provision
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

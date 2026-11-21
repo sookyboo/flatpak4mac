@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Runs as a root SYSTEM service, not as the flatpak user's SSH/session scope.
+# Never invoke synchronously from an SSH session owned by flatpak.
+set -Eeuo pipefail
+[[ "$(id -u)" == 0 ]] || { echo 'Requires root' >&2; exit 1; }
+mode="${1:-}"
+case "$mode" in
+  xfce|plasma-x11|plasma-wayland|retrodeck) ;;
+  *) echo "Invalid mode: $mode" >&2; exit 2 ;;
+esac
+log(){ echo "[flatpak4mac-session-switch] $*"; }
+log "Starting clean graphical session transition to $mode"
+# Set the requested session in the LightDM file BEFORE this service is
+# scheduled. Stopping LightDM closes the old display and graphical apps.
+systemctl stop lightdm.service
+# Ensure an unexpected cleanup failure does not strand the VM without a GUI.
+trap 'systemctl start lightdm.service || true' ERR
+# Terminate the *entire* old desktop user manager so KDE's user-scoped KWin,
+# plasmashell, DBus activations, and Wayland DISPLAY cannot leak into XFCE.
+# This also terminates SSH sessions logged in as flatpak. That's intentional;
+# the root system service and its log continue independently of those sessions.
+loginctl terminate-user flatpak || log 'No existing flatpak session to terminate'
+# Let logind finish retiring the old user manager and its environment.
+for i in {1..20}; do
+  if ! systemctl -q is-active user@$(id -u flatpak).service; then
+    break
+  fi
+  sleep 0.25
+done
+systemctl start lightdm.service
+trap - ERR
+log "LightDM started for requested session: $mode"
+# This is diagnostic only: readiness of the GUI is NOT a prerequisite to the
+# system-level transition being reported. Check both the compositor and shell.
+ready=0
+for i in {1..30}; do
+  case "$mode" in
+    xfce) pgrep -u flatpak -x xfwm4 >/dev/null && pgrep -u flatpak -x xfce4-panel >/dev/null && pgrep -u flatpak -x xfdesktop >/dev/null && ready=1 ;;
+    plasma-wayland) pgrep -u flatpak -x kwin_wayland >/dev/null && pgrep -u flatpak -x plasmashell >/dev/null && ready=1 ;;
+    plasma-x11) pgrep -u flatpak -x kwin_x11 >/dev/null && pgrep -u flatpak -x plasmashell >/dev/null && ready=1 ;;
+    retrodeck) pgrep -u flatpak -f '/flatpak4mac-retrodeck-session' >/dev/null && ready=1 ;;
+  esac
+  if [[ "$ready" == 1 ]]; then
+    log "Session processes confirmed for $mode"
+    exit 0
+  fi
+  sleep 1
+done
+log "WARNING: $mode compositor/desktop not confirmed within 30s; inspect LightDM and user journal"
+exit 1

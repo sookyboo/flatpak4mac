@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Dedicated LightDM X11 session; no XFCE window manager or panel is started.
+set -Eeuo pipefail
+# Emit timestamps in the guest journal to separate X11 session startup from
+# Flatpak startup. No graphics-related environment overrides are applied.
+start_epoch="$(date +%s)"
+log_perf() {
+  local elapsed
+  elapsed=$(( $(date +%s) - start_epoch ))
+  logger -t flatpak4mac-retrodeck -- "$* (elapsed=${elapsed}s)" 2>/dev/null || true
+  printf '[retrodeck +%ss] %s\n' "$elapsed" "$*"
+}
+log_perf 'LightDM started dedicated RetroDECK session'
+export XDG_SESSION_DESKTOP=flatpak4mac-retrodeck
+export XDG_CURRENT_DESKTOP=RetroDECK
+export XDG_SESSION_TYPE=x11
+# The VM must already have its 9p share mounted from /etc/fstab.
+if ! mountpoint -q /home/flatpak/retrodeck; then
+  log_perf 'RetroDECK VirtFS share is not mounted; returning to XFCE' >&2
+else
+  # Keep the app in the foreground: this process owns the LightDM session.
+  # The standard session wrapper provides DISPLAY, XAUTHORITY and D-Bus.
+  log_perf 'Starting RetroDECK Flatpak'
+  if flatpak run --system net.retrodeck.retrodeck//arm-0.11.0; then
+    log_perf 'RetroDECK Flatpak exited normally'
+  else
+    status=$?
+    log_perf "RetroDECK Flatpak exited with status $status" >&2
+  fi
+fi
+# Prevent LightDM autologin from repeatedly relaunching a closed/crashed app.
+# Switch the next login to XFCE and let LightDM complete a normal logout.
+if sudo /usr/local/sbin/flatpak4mac-session-mode xfce --no-restart; then
+  # LightDM reads its configured autologin session at daemon startup. Restart
+  # it after this session closes so it cannot immediately autologin RetroDECK
+  # again. Keep this X11 session alive until the scheduled restart executes.
+  log_perf 'Scheduling LightDM restart to return to XFCE'
+  old_lightdm_pid="$(systemctl show -p MainPID --value lightdm.service 2>/dev/null || true)"
+  if sudo systemd-run --quiet --collect --unit=flatpak4mac-return-to-xfce --on-active=1s \
+    /usr/bin/systemctl restart lightdm.service; then
+    # Remain attached to LightDM until it stops this session. This avoids a
+    # fixed startup delay and prevents immediate RetroDECK relaunch loops.
+    # The bounded fallback exits if the restart never happens.
+    for ((i=0; i<60; i++)); do
+      sleep 0.25
+      new_lightdm_pid="$(systemctl show -p MainPID --value lightdm.service 2>/dev/null || true)"
+      if [[ -n "$old_lightdm_pid" && "$old_lightdm_pid" != 0 && "$new_lightdm_pid" != "$old_lightdm_pid" ]]; then
+        log_perf 'LightDM process changed; restart observed'
+        break
+      fi
+    done
+  else
+    log_perf 'Could not schedule LightDM restart; returning to greeter' >&2
+  fi
+fi
